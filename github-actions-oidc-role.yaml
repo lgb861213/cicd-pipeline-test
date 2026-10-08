@@ -1,0 +1,199 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: GitHub Actions OIDC deploy role with least-privilege policies for EC2 lifecycle and SSM web deployment
+
+Parameters:
+  CreateOIDCProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Set to true only if the GitHub OIDC provider does not exist in this account yet
+  GitHubOwner:
+    Type: String
+    Default: lgb861213
+    Description: GitHub user or organization name
+  GitHubOwnerId:
+    Type: String
+    Default: "57423996"
+    Description: Immutable numeric owner ID (leave empty for legacy sub format)
+  GitHubRepo:
+    Type: String
+    Default: cicd-pipeline-test
+    Description: GitHub repository name
+  GitHubRepoId:
+    Type: String
+    Default: "1410050389"
+    Description: Immutable numeric repository ID (leave empty for legacy sub format)
+  GitHubEnvironment:
+    Type: String
+    Default: prod
+    Description: GitHub environment name used by the deploy job
+  RoleName:
+    Type: String
+    Default: github-actions-prod-deploy
+    Description: IAM role name assumed by GitHub Actions
+  DeploymentMode:
+    Type: String
+    AllowedValues: [Ec2Lifecycle, SsmDeploy, Both]
+    Default: SsmDeploy
+    Description: Ec2Lifecycle = create and terminate test instances, SsmDeploy = deploy to existing instances, Both = attach both policies
+  ManagedByTag:
+    Type: String
+    Default: github-actions
+    Description: Value of the ManagedBy tag required on instances launched by the workflow
+  AppTagValue:
+    Type: String
+    Default: cicd-web
+    Description: Value of the App tag on target instances for SSM deployment
+
+Conditions:
+  ShouldCreateProvider: !Equals [!Ref CreateOIDCProvider, "true"]
+  UseImmutableSub: !And
+    - !Not [!Equals [!Ref GitHubOwnerId, ""]]
+    - !Not [!Equals [!Ref GitHubRepoId, ""]]
+  AttachEc2Lifecycle: !Or
+    - !Equals [!Ref DeploymentMode, Ec2Lifecycle]
+    - !Equals [!Ref DeploymentMode, Both]
+  AttachSsmDeploy: !Or
+    - !Equals [!Ref DeploymentMode, SsmDeploy]
+    - !Equals [!Ref DeploymentMode, Both]
+
+Resources:
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: Role assumed by GitHub Actions via OIDC
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !If
+                  - UseImmutableSub
+                  - !Sub repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:environment:${GitHubEnvironment}
+                  - !Sub repo:${GitHubOwner}/${GitHubRepo}:environment:${GitHubEnvironment}
+
+  Ec2LifecyclePolicy:
+    Type: AWS::IAM::RolePolicy
+    Condition: AttachEc2Lifecycle
+    Properties:
+      RoleName: !Ref DeployRole
+      PolicyName: github-actions-ec2-lifecycle
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadAmiParameter
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+            Resource: "*"
+          - Sid: DescribeReadOnly
+            Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeInstanceStatus
+              - ec2:DescribeImages
+              - ec2:DescribeSubnets
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeKeyPairs
+            Resource: "*"
+          - Sid: RunInstancesSmallTypesWithTag
+            Effect: Allow
+            Action: ec2:RunInstances
+            Resource: !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*
+            Condition:
+              StringLike:
+                ec2:InstanceType: ["t3.*", "t4g.*"]
+              StringEquals:
+                aws:RequestTag/ManagedBy: !Ref ManagedByTag
+          - Sid: RunInstancesSupportingResources
+            Effect: Allow
+            Action: ec2:RunInstances
+            Resource:
+              - !Sub arn:${AWS::Partition}:ec2:*::image/*
+              - !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:subnet/*
+              - !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:security-group/*
+              - !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:network-interface/*
+              - !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:volume/*
+              - !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:key-pair/*
+          - Sid: TagOnlyAtLaunch
+            Effect: Allow
+            Action: ec2:CreateTags
+            Resource: !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:*/*
+            Condition:
+              StringEquals:
+                ec2:CreateAction: RunInstances
+          - Sid: ManageOnlyOwnInstances
+            Effect: Allow
+            Action:
+              - ec2:StartInstances
+              - ec2:StopInstances
+              - ec2:RebootInstances
+              - ec2:TerminateInstances
+            Resource: !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*
+            Condition:
+              StringEquals:
+                aws:ResourceTag/ManagedBy: !Ref ManagedByTag
+
+  SsmDeployPolicy:
+    Type: AWS::IAM::RolePolicy
+    Condition: AttachSsmDeploy
+    Properties:
+      RoleName: !Ref DeployRole
+      PolicyName: github-actions-ssm-deploy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DescribeTargets
+            Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ssm:DescribeInstanceInformation
+            Resource: "*"
+          - Sid: SendCommandToTaggedInstances
+            Effect: Allow
+            Action: ssm:SendCommand
+            Resource: !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*
+            Condition:
+              StringEquals:
+                ssm:resourceTag/App: !Ref AppTagValue
+          - Sid: SendCommandRunShellScriptOnly
+            Effect: Allow
+            Action: ssm:SendCommand
+            Resource: !Sub arn:${AWS::Partition}:ssm:*::document/AWS-RunShellScript
+          - Sid: ReadCommandResults
+            Effect: Allow
+            Action:
+              - ssm:GetCommandInvocation
+              - ssm:ListCommandInvocations
+              - ssm:ListCommands
+            Resource: "*"
+
+Outputs:
+  RoleArn:
+    Description: Store this value as the AWS_ROLE_ARN environment secret in GitHub
+    Value: !GetAtt DeployRole.Arn
+  SubjectClaim:
+    Description: Expected sub claim in the trust policy
+    Value: !If
+      - UseImmutableSub
+      - !Sub repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:environment:${GitHubEnvironment}
+      - !Sub repo:${GitHubOwner}/${GitHubRepo}:environment:${GitHubEnvironment}
+  DeploymentMode:
+    Description: Attached permission set
+    Value: !Ref DeploymentMode

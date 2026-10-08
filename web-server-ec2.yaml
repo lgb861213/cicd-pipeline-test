@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Web server EC2 instance (Amazon Linux 2023 + nginx) managed by SSM for CI/CD deployment tests
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the web server
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet with auto-assign public IP (or route to an internet gateway)
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair for SSH access
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+    Description: Instance type
+  AllowedHttpCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to access HTTP port 80 (use x.x.x.x/32 to restrict)
+  AllowedSshCidr:
+    Type: String
+    Default: ""
+    Description: Optional CIDR allowed for SSH port 22 (leave empty to disable SSH rule)
+  AppTagValue:
+    Type: String
+    Default: cicd-web
+    Description: Value of the App tag used by the workflow to locate the target instance
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI from the public SSM parameter
+
+Conditions:
+  HasSsh: !Not [!Equals [!Ref AllowedSshCidr, ""]]
+
+Resources:
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP access to the web server
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedHttpCidr
+          Description: HTTP
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppTagValue}-sg
+
+  SshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSsh
+    Properties:
+      GroupId: !Ref WebSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref AllowedSshCidr
+      Description: SSH
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Instance role for SSM managed node
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      KeyName: !Ref KeyName
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+          dnf install -y nginx
+          cat > /usr/share/nginx/html/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html><head><meta charset="utf-8"><title>CI/CD Demo</title></head>
+          <body style="font-family:Arial;text-align:center;margin-top:80px">
+          <h1>CI/CD Demo - Initial Version</h1>
+          <p>Deployed by CloudFormation user data. Waiting for the first GitHub Actions release.</p>
+          </body></html>
+          HTML
+          systemctl enable --now nginx
+      Tags:
+        - Key: Name
+          Value: !Ref AppTagValue
+        - Key: App
+          Value: !Ref AppTagValue
+        - Key: ManagedBy
+          Value: github-actions
+
+Outputs:
+  InstanceId:
+    Description: Web server instance ID
+    Value: !Ref WebServer
+  PublicIp:
+    Description: Public IP of the web server
+    Value: !GetAtt WebServer.PublicIp
+  WebUrl:
+    Description: Web site URL
+    Value: !Sub http://${WebServer.PublicIp}/
+  AppTag:
+    Description: Tag value used by the workflow (store as APP_TAG variable)
+    Value: !Ref AppTagValue
