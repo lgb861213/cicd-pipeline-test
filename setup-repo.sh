@@ -1,3 +1,35 @@
+#!/bin/bash
+# Run inside the local cicd-pipeline-test repository
+set -e
+
+mkdir -p app .github/workflows
+
+# ---------- Web page source (edit this file to simulate a release) ----------
+tee app/index.html > /dev/null <<'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>CI/CD Demo</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; margin-top: 80px; background: #f4f8fb; }
+    .card { display: inline-block; padding: 32px 48px; background: #fff; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.08); }
+    h1 { color: #1F4E79; }
+    .meta { color: #666; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Hello from GitHub Actions - Release v1</h1>
+    <p>This page is deployed to an existing EC2 instance via AWS Systems Manager.</p>
+    <p class="meta">Version: __VERSION__ | Commit: __COMMIT__ | Deployed at: __TIME__</p>
+  </div>
+</body>
+</html>
+EOF
+
+# ---------- Workflow ----------
+tee .github/workflows/cicd.yml > /dev/null <<'EOF'
 name: Deploy Web to Existing EC2 with Approval
 
 on:
@@ -132,3 +164,6 @@ jobs:
             sleep 5
           done
           echo "Smoke test failed: $URL does not show $VERSION"; exit 1
+EOF
+
+echo "Files written: app/index.html, .github/workflows/cicd.yml"
