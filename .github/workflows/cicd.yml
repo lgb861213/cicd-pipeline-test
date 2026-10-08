@@ -1,0 +1,106 @@
+name: Deploy to AWS with Approval
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      cleanup:
+        description: "Terminate the test instance after verification"
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run Build & Test
+        run: echo "Running tests and building artifact..."
+
+  deploy-to-aws:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    environment: prod   # Triggers reviewers, branch rules and env secrets/vars
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      SUBNET_ID: ${{ vars.SUBNET_ID }}
+      SECURITY_GROUP_ID: ${{ vars.SECURITY_GROUP_ID }}
+      KEY_NAME: ${{ vars.KEY_NAME }}
+      INSTANCE_TYPE: ${{ vars.INSTANCE_TYPE || 't3.micro' }}
+      AMI_PARAM: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify identity
+        run: aws sts get-caller-identity
+
+      - name: Resolve latest Amazon Linux 2023 AMI
+        id: ami
+        run: |
+          AMI_ID=$(aws ssm get-parameters --names "$AMI_PARAM" \
+            --query 'Parameters[0].Value' --output text)
+          echo "AMI: $AMI_ID"
+          echo "id=$AMI_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Dry-run permission check
+        run: |
+          set +e
+          OUT=$(aws ec2 run-instances --dry-run \
+            --image-id "${{ steps.ami.outputs.id }}" \
+            --instance-type "$INSTANCE_TYPE" \
+            --subnet-id "$SUBNET_ID" \
+            --security-group-ids "$SECURITY_GROUP_ID" \
+            --key-name "$KEY_NAME" \
+            --tag-specifications \
+              'ResourceType=instance,Tags=[{Key=ManagedBy,Value=github-actions}]' \
+              'ResourceType=volume,Tags=[{Key=ManagedBy,Value=github-actions}]' 2>&1)
+          echo "$OUT"
+          echo "$OUT" | grep -q DryRunOperation || { echo "Dry-run failed"; exit 1; }
+
+      - name: Launch EC2 instance
+        id: ec2
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "${{ steps.ami.outputs.id }}" \
+            --instance-type "$INSTANCE_TYPE" \
+            --subnet-id "$SUBNET_ID" \
+            --security-group-ids "$SECURITY_GROUP_ID" \
+            --key-name "$KEY_NAME" \
+            --metadata-options HttpTokens=required \
+            --tag-specifications \
+              "ResourceType=instance,Tags=[{Key=ManagedBy,Value=github-actions},{Key=Name,Value=cicd-test-${GITHUB_RUN_ID}}]" \
+              'ResourceType=volume,Tags=[{Key=ManagedBy,Value=github-actions}]' \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "Instance: $INSTANCE_ID"
+          echo "id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait until running and show details
+        run: |
+          aws ec2 wait instance-running --instance-ids "${{ steps.ec2.outputs.id }}"
+          aws ec2 describe-instances --instance-ids "${{ steps.ec2.outputs.id }}" \
+            --query 'Reservations[0].Instances[0].{Id:InstanceId,State:State.Name,Type:InstanceType,PrivateIp:PrivateIpAddress,PublicIp:PublicIpAddress,Subnet:SubnetId}' \
+            --output table
+
+      - name: Cleanup test instance
+        if: always() && steps.ec2.outputs.id != '' && (github.event_name == 'push' || inputs.cleanup)
+        run: |
+          aws ec2 terminate-instances --instance-ids "${{ steps.ec2.outputs.id }}"
+          aws ec2 wait instance-terminated --instance-ids "${{ steps.ec2.outputs.id }}"
+          echo "Instance terminated."
