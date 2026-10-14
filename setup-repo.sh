@@ -5,7 +5,10 @@ set -e
 mkdir -p app .github/workflows
 
 # ---------- Web page source (edit this file to simulate a release) ----------
-tee app/index.html > /dev/null <<'EOF'
+# 每次运行都生成一个唯一的构建标记，确保 app/index.html 内容必然变化，
+# 从而命中 workflow 的 paths: app/** 过滤，一定触发一次新的部署。
+BUILD_TAG="$(date +%Y%m%d-%H%M%S)-$RANDOM"
+tee app/index.html > /dev/null <<EOF
 <!DOCTYPE html>
 <html>
 <head>
@@ -23,6 +26,7 @@ tee app/index.html > /dev/null <<'EOF'
     <h1>Hello from GitHub Actions - Release v1</h1>
     <p>This page is deployed to an existing EC2 instance via AWS Systems Manager.</p>
     <p class="meta">Version: __VERSION__ | Commit: __COMMIT__ | Deployed at: __TIME__</p>
+    <!-- build: ${BUILD_TAG} -->
   </div>
 </body>
 </html>
